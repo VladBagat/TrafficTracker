@@ -1,5 +1,4 @@
 services:
-  services:
   kafka:
     image: apache/kafka-native
     ports:
