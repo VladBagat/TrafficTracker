@@ -1,11 +1,11 @@
-FROM rust:1.91-alpine as builder
+FROM rust:alpine AS builder
 WORKDIR /producer
 # Install C build toolchain and library dependencies
-RUN apk add --no-cache build-base cmake pkgconfig openssl-dev cyrus-sasl-dev zlib-dev
+#RUN apk add --no-cache build-base cmake pkgconfig openssl-dev cyrus-sasl-dev zlib-dev
+RUN apk add --no-cache build-base cmake pkgconf openssl-dev cyrus-sasl-dev zlib-dev zlib-static
 COPY . .
 RUN cargo install --path .
 
 FROM alpine:3.18
-#RUN apt-get update && apt-get install -y extra-runtime-dependencies && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/cargo/bin/producer /usr/local/bin/producer
 CMD ["producer"]
