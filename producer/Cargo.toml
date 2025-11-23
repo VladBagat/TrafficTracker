@@ -5,8 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8.7"
+axum = { version = "0.8.7", features = ["macros"] }
 env_logger = "0.11.8"
 log = "0.4.28"
 rdkafka = { version = "0.38", features = ["cmake-build"] }
+serde = "1.0.228"
 tokio = { version = "1.48.0", features = ["full"]}
+futures = "0.3.31"
+futures-util = "0.3.31"
+rustls = { version = "0.23", features = ["ring","logging","tls12"], default-features = false }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
