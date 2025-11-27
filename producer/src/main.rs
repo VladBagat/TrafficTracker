@@ -108,12 +108,12 @@ impl EngineActor {
                 s2: data.o.s2,
                 o: data.o.o,
                 f: data.o.f,
-                q: data.o.q.parse().expect("q of wrong format"),
-                p: data.o.p.parse().expect("p of wrong format"),
-                ap: data.o.ap.parse().expect("ap of wrong format"),
+                q: data.o.q.parse().unwrap_or(0f64),
+                p: data.o.p.parse().unwrap_or(0f64),
+                ap: data.o.ap.parse().unwrap_or(0f64),
                 x: data.o.x,
-                l: data.o.l.parse().expect("l of wrong format"),
-                z: data.o.z.parse().expect("z of wrong format"),
+                l: data.o.l.parse().unwrap_or(0f64),
+                z: data.o.z.parse().unwrap_or(0f64),
                 t: data.o.t,
             };
 
