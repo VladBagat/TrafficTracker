@@ -1,24 +1,23 @@
 use axum::extract::State;
 use axum::http::StatusCode;
-use log::{info, warn};
-use rdkafka::{ClientContext, TopicPartitionList, Message};
+use log::{debug, info};
+use rdkafka::{ClientContext, Message, Statistics, TopicPartitionList};
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::*;
 use rdkafka::error::KafkaResult;
-use rdkafka::message::Headers;
-use axum::{routing::get, Router, routing::post};
-use std::default;
+use axum::{Router, routing::post};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use apache_avro::{Schema, to_avro_datum, to_value};
+use apache_avro::{Schema, from_value, Reader, from_avro_datum};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::consumer::Consumer;
+use tokio::time::Duration;
 
 
-use crate::force_order::{ForceOrder, ForceOrderFlat};
+use crate::force_order::{ForceOrderFlat};
 mod force_order;
 
 enum Commands {
@@ -57,8 +56,22 @@ impl EngineActor {
     async fn run(mut self) {
         loop {
             tokio::select! {
-                Ok(msg) = self.state.consumer.as_ref().unwrap().recv() => {
-                    
+                msg = self.state.consumer.as_ref().unwrap().recv() => {
+                    match msg {
+                        Ok(msg) => {
+                            if self.state.paused { continue; }
+                            let mut payload = msg.payload().expect("Message has no payload");
+                            let schema = self.state.force_order_avro_schema.as_mut().expect("Avro scheme failed to initialize");
+                            info!("Recieved raw message {:?}", payload);
+                            let value = from_avro_datum(schema, &mut payload, None);
+                            let encoded = from_value::<ForceOrderFlat>(&value.unwrap()).expect("Deserialization failed");
+                                info!("Recieved message {:?}", encoded)
+                        }
+                        Err(e) => {
+                            info!("Consumer recv error: {:?}. Retrying in 1 second.", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
                 }
                 Some(msg) = self.command_reciever.recv() => {
                     match msg {
@@ -100,8 +113,8 @@ impl EngineActor {
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "true")
-            .set("statistics.interval.ms", "30000")
-            .set_log_level(RDKafkaLogLevel::Debug);
+            .set("statistics.interval.ms", "60000")
+            .set_log_level(RDKafkaLogLevel::Warning);
 
         /*if let Some(assignor) = assignor {
             config
@@ -115,14 +128,18 @@ impl EngineActor {
             .expect("Consumer creation failed");
 
         consumer
-            .subscribe(&["binance_liquidations"])
+            .subscribe(&["binance-liquidations"])
             .expect("Can't subscribe to specified topics");
 
         self.state.consumer = Some(Arc::new(consumer));
     }
 }
 struct CustomContext;
-impl ClientContext for CustomContext {}
+impl ClientContext for CustomContext {
+    fn stats(&self, stats: Statistics) {
+        debug!("rdkafka stats: {:?}", stats);
+    }
+}
 
 impl ConsumerContext for CustomContext {
     fn pre_rebalance(&self, _: &BaseConsumer<Self>, rebalance: &Rebalance) {
