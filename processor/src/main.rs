@@ -9,7 +9,7 @@ use axum::{Router, routing::post};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use apache_avro::{Schema, from_value, Reader, from_avro_datum};
+use apache_avro::{Schema, from_value, from_avro_datum};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use rdkafka::consumer::stream_consumer::StreamConsumer;
@@ -17,8 +17,7 @@ use rdkafka::consumer::Consumer;
 use tokio::time::Duration;
 
 
-use crate::force_order::{ForceOrderFlat};
-mod force_order;
+use shared::force_order::{ForceOrderFlat, get_avro_schema};
 
 enum Commands {
     GetStatus {
@@ -101,7 +100,7 @@ impl EngineActor {
     }
 
     fn engine_startup(&mut self) {
-        self.state.force_order_avro_schema = Some(force_order::get_avro_schema());
+        self.state.force_order_avro_schema = Some(get_avro_schema());
 
         let context = CustomContext;
 

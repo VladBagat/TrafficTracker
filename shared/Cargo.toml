@@ -1,0 +1,9 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+apache-avro = "0.21.0"
+serde = "1.0.228"
+serde_derive = "1.0.228"

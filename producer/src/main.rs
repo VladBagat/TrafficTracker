@@ -18,8 +18,7 @@ use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 
 
-use crate::force_order::{ForceOrder, ForceOrderFlat};
-mod force_order;
+use shared::force_order::{ForceOrder, ForceOrderFlat, get_avro_schema};
 
 enum Commands {
     GetStatus {
@@ -128,7 +127,7 @@ impl EngineActor {
     }
 
     fn engine_startup(&mut self) {
-        self.state.force_order_avro_schema = Some(force_order::get_avro_schema());
+        self.state.force_order_avro_schema = Some(get_avro_schema());
 
         let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &self.state.brokers)
