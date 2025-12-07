@@ -1,27 +1,29 @@
 use axum::extract::State;
 use axum::http::StatusCode;
-use log::{debug, info};
+use log::{debug, error, info};
+use rdkafka::message::{BorrowedMessage, Header, OwnedHeaders};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientContext, Message, Statistics, TopicPartitionList};
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::*;
 use rdkafka::error::KafkaResult;
 use axum::{Router, routing::post};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use apache_avro::{Schema, from_value, from_avro_datum};
+use apache_avro::{Schema, from_avro_datum, from_value, to_avro_datum, to_value};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::consumer::Consumer;
-use tokio::time::Duration;
 
 
-use shared::force_order::{ForceOrderFlat, get_avro_schema};
+use shared::{force_order, processed_force_order};
 
 enum Commands {
     GetStatus {
-        respond_to: oneshot::Sender<EngineState>
+        respond_to: oneshot::Sender<LoggingState>
     },
     Pause {
         respond_to: oneshot::Sender<bool>
@@ -36,12 +38,60 @@ struct EngineActor {
     state: EngineState
 }
 
-#[derive(Clone)]
 struct EngineState {
     paused: bool,
     force_order_avro_schema: Option<Schema>,
+    processed_avro_schema: Option<Schema>,
     brokers: String,
-    consumer: Option<Arc<KafkaConsumer>>
+    consumer: Option<KafkaConsumer>,
+    producer: Option<FutureProducer>,
+    calculation_state: CalculationState,
+    logging_state: LoggingState
+}
+
+#[derive(Clone, PartialEq, PartialOrd, Eq)]
+struct LoggingState {
+    running_time: u64,
+    successful_runs: u64,
+    failed_runs: u64,
+    state_message: String
+}
+
+impl Default for LoggingState {
+    fn default() -> Self {
+        Self { 
+            running_time: 0,
+            successful_runs: 0,
+            failed_runs: 0,
+            state_message: String::from("State logging is not implemented")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CalculationState {
+    symbol_ca_map: HashMap<String, CumulativeAverage>
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Default)]
+struct CumulativeAverage{
+    average: f64,
+    n: i32,
+    first_timestamp: i64
+}
+
+impl CumulativeAverage {
+    fn new(first_timestamp: i64) -> CumulativeAverage {
+        CumulativeAverage {
+            average: 0f64,
+            n: 0,
+            first_timestamp: first_timestamp
+        }
+        
+    }
+    fn add(&mut self, x: f64) {
+        self.average = (x + (self.n as f64 * self.average)) / (self.n + 1) as f64;
+    }
 }
 
 type KafkaConsumer = StreamConsumer<CustomContext>;
@@ -53,29 +103,23 @@ struct AxumState {
 
 impl EngineActor {
     async fn run(mut self) {
+        let consumer = self.state.consumer.take().unwrap(); 
         loop {
             tokio::select! {
-                msg = self.state.consumer.as_ref().unwrap().recv() => {
+                msg = consumer.recv() => {
                     match msg {
                         Ok(msg) => {
-                            if self.state.paused { continue; }
-                            let mut payload = msg.payload().expect("Message has no payload");
-                            let schema = self.state.force_order_avro_schema.as_mut().expect("Avro scheme failed to initialize");
-                            info!("Recieved raw message {:?}", payload);
-                            let value = from_avro_datum(schema, &mut payload, None);
-                            let encoded = from_value::<ForceOrderFlat>(&value.unwrap()).expect("Deserialization failed");
-                                info!("Recieved message {:?}", encoded)
+                            self.process_message(msg).await;
                         }
                         Err(e) => {
-                            info!("Consumer recv error: {:?}. Retrying in 1 second.", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            error!("Consumer recv error: {:?}.", e);
                         }
                     }
                 }
                 Some(msg) = self.command_reciever.recv() => {
                     match msg {
                         Commands::GetStatus { respond_to } => {
-                            let _ = respond_to.send(self.state.clone());
+                            let _ = respond_to.send(LoggingState::default());
                         },
                         Commands::Pause { respond_to } => {
                             if self.state.paused {
@@ -100,7 +144,8 @@ impl EngineActor {
     }
 
     fn engine_startup(&mut self) {
-        self.state.force_order_avro_schema = Some(get_avro_schema());
+        self.state.force_order_avro_schema = Some(force_order::get_avro_schema());
+        self.state.processed_avro_schema = Some(processed_force_order::get_avro_schema());
 
         let context = CustomContext;
 
@@ -130,7 +175,71 @@ impl EngineActor {
             .subscribe(&["binance-liquidations"])
             .expect("Can't subscribe to specified topics");
 
-        self.state.consumer = Some(Arc::new(consumer));
+        self.state.consumer = Some(consumer);
+
+        let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &self.state.brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("Producer creation error");
+
+        self.state.producer = Some(producer);
+    }
+
+    async fn process_message(&mut self, message: BorrowedMessage<'_>) {
+        if self.state.paused { return; }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+        let mut payload = message.payload().expect("Message has no payload");
+        let schema = self.state.force_order_avro_schema.as_mut().expect("Avro scheme failed to initialize");
+        let value = from_avro_datum(schema, &mut payload, None).unwrap();
+        let decoded = from_value::<force_order::ForceOrderFlat>(&value).expect("Deserialization failed");
+        
+        if !decoded.x.eq("FILLED") && !decoded.x.eq("PARTIALLY_FILLED") {
+            return;
+        }
+        let data = self.state.calculation_state.symbol_ca_map.entry(decoded.s.clone()).or_insert(CumulativeAverage::new(decoded.t));
+
+        if decoded.t - data.first_timestamp > 15000 {
+            let processed = shared::processed_force_order::ProcessedFOFlat{
+                e: decoded.e2,
+                s: decoded.s.clone(),
+                s2: decoded.s2,
+                o: decoded.o,
+                f: decoded.f,
+                ca: data.average,
+                p: 15,
+            };
+            let schema = self.state.processed_avro_schema.as_mut().expect("Avro scheme failed to initialize");
+            let avro_value = to_value(&processed).expect("serde -> Avro Value failed");
+            let encoded = to_avro_datum(schema, avro_value).expect("Non-compliance with Avro scheme. Bad sanitization.");
+
+            
+            *data = CumulativeAverage::new(decoded.t);
+            data.add(decoded.ap * decoded.l);
+            let _ = self.push_to_topic(&decoded.s, &encoded, now).await;
+        } else {
+            data.add(decoded.ap * decoded.l);
+        }
+    }
+
+    async fn push_to_topic(&self, key: &str, message: &Vec<u8>, process_start: u64) -> anyhow::Result<()> {
+        // ts when Processor sends message
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+
+        let record = FutureRecord::to("binance-liquidations-processed")
+                .key(key)
+                .payload(message)
+                .headers(OwnedHeaders::new()
+                    .insert(Header { key: "source", value: Some("Processor #1") })
+                    .insert(Header { key: "recieval_ts", value: Some(&process_start.to_string()) })
+                    .insert(Header { key: "ingest_ts", value: Some(&now.to_string()) })
+                );
+
+        if let Err(e) = self.state.producer.as_ref().unwrap().send_result(record) {
+            error!("Message send failed.{:?}", e);
+        }
+
+        Ok(())
     }
 }
 struct CustomContext;
@@ -166,8 +275,12 @@ async fn main() -> anyhow::Result<()> {
         state: EngineState { 
             paused: true,
             force_order_avro_schema: None,
+            processed_avro_schema: None,
             brokers:std::env::var("KAFKA_BROKERS").unwrap_or("localhost:9092".to_string()),
-            consumer: None
+            consumer: None,
+            producer: None,
+            calculation_state: CalculationState::default(),
+            logging_state: LoggingState::default()
         }
     };
 
