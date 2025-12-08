@@ -87,10 +87,10 @@ impl CumulativeAverage {
             n: 0,
             first_timestamp: first_timestamp
         }
-        
     }
     fn add(&mut self, x: f64) {
         self.average = (x + (self.n as f64 * self.average)) / (self.n + 1) as f64;
+        self.n += 1;
     }
 }
 
