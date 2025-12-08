@@ -17,8 +17,9 @@ use futures::stream::{SplitSink, SplitStream, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 
-
 use shared::force_order::{ForceOrder, ForceOrderFlat, get_avro_schema};
+
+static VERSION: i64 = 1;
 
 enum Commands {
     GetStatus {
@@ -44,7 +45,8 @@ struct EngineState {
     paused: bool,
     force_order_avro_schema: Option<Schema>,
     brokers: String,
-    producer: Option<FutureProducer>
+    producer: Option<FutureProducer>,
+    last_processed_timestamp: u64
 }
 
 #[derive(Clone)]
@@ -54,29 +56,40 @@ struct AxumState {
 
 impl EngineActor {
     async fn run(mut self) {
-        let ping_interval = 5;
-        let mut ticker = interval(Duration::from_secs(ping_interval));
+        let timeout_threshold = 1_000_000;
+        let mut ticker = interval(Duration::from_micros(timeout_threshold));
+        let timeout_seconds = timeout_threshold / 1e6 as u64;
 
         loop {
             tokio::select! {
-                Some(Ok(msg)) = self.ws_read.next() => {
-                    if self.state.paused { continue; }
-                    self.process_message(msg).await;
+                msg_result = self.ws_read.next() => {
+                    match msg_result {
+                        Some(Ok(msg)) => {
+                            if self.state.paused { continue; }
+                            self.process_message(msg).await;
+                        }
+                        Some(Err(e)) => {
+                            info!("Some error runs");
+                            error!("WebSocket read error: {:?}. Attempting reconnection...", e);
+                            self.attempt_reconnect().await;
+                        }
+                        None => {
+                            info!("None error runs");
+                            error!("WebSocket stream ended. Attempting reconnection...");
+                            self.attempt_reconnect().await;
+                        }
+                    }
                 }
                 _ = ticker.tick() => {
-                    if let Err(_) = self.ws_write.send(Message::Ping(vec![])).await {
-                        error!("Lost connection to Binance WebSocket. Reconnecting...");
-                        let force_order_url = "wss://fstream.binance.com/ws/!forceOrder@arr"; //TODO: Drops on connection loss. Must find a way to re-connect
-                        match connect_async(force_order_url).await {
-                            Ok((ws_stream, _)) => {
-                                let (write, read) = ws_stream.split();
-                                self.ws_read = read;
-                                self.ws_write = write;
-                            },
-                            Err(err) => {
-                                error!("Failed to reconnect. Trying in {} seconds. Error: {}", ping_interval, err);
-                            } 
+                    info!("Ticker runs");
+                    let last_timestamp = self.state.last_processed_timestamp;
+                    let cur_time = shared::current_time_micros!();
+                    if cur_time - last_timestamp > timeout_threshold {
+                        if let Err(_) = self.ws_write.send(Message::Ping(vec![])).await {
+                            error!("No message processed in {}. Lost connection to Binance WebSocket. Reconnecting...", timeout_seconds);
+                            self.attempt_reconnect().await;
                         }
+                        // Socket is just boring
                     }  
                 }
                 Some(msg) = self.command_reciever.recv() => {
@@ -105,9 +118,27 @@ impl EngineActor {
             }
         }
     }
+
+    // Helper method to handle reconnection logic
+    async fn attempt_reconnect(&mut self) {
+        let force_order_url = "wss://fstream.binance.com/ws/!forceOrder@arr";
+        match connect_async(force_order_url).await {
+            Ok((ws_stream, _)) => {
+                let (write, read) = ws_stream.split();
+                self.ws_read = read;
+                self.ws_write = write;
+                info!("Reconnected to Binance WebSocket successfully.");
+            },
+            Err(err) => {
+                error!("Failed to reconnect. Retrying in 1 second. Error: {}.", err);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } 
+        }
+    }
+
     async fn process_message(&mut self, msg: Message) {
         // ts when Producer recieved message
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+        let now = shared::current_time_micros!();
 
         let json_msg = &msg.into_text().unwrap();
 
@@ -118,6 +149,8 @@ impl EngineActor {
 
             // When Biannce Event happened
             let event_time = data.e2 as u64;
+
+            self.state.last_processed_timestamp = event_time;
 
             let flat = ForceOrderFlat {
                 e: data.e,
@@ -159,7 +192,7 @@ impl EngineActor {
 
     async fn push_to_topic(&self, key: &str, message: &Vec<u8>, event_time: u64, process_start: u64) -> anyhow::Result<()> {
         // ts when Producer ingested message
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
+        let now = shared::current_time_micros!();
 
         let record = FutureRecord::to("binance-liquidations")
                 .key(key)
@@ -182,7 +215,7 @@ impl EngineActor {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init(); 
-    info!("Producer started");
+    info!("Producer started. Version: {}", VERSION);
 
     let (tx, rx) = mpsc::channel(128);
 
@@ -200,7 +233,8 @@ async fn main() -> anyhow::Result<()> {
             paused: true,
             force_order_avro_schema: None,
             brokers:std::env::var("KAFKA_BROKERS").unwrap_or("localhost:9092".to_string()),
-            producer: None
+            producer: None,
+            last_processed_timestamp: shared::current_time_micros!()
         }
     };
 
