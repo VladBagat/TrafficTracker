@@ -9,6 +9,7 @@ use rdkafka::consumer::*;
 use rdkafka::error::KafkaResult;
 use axum::{Router, routing::post};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -211,11 +212,15 @@ impl EngineActor {
                 ca: data.average,
                 p: 15,
             };
-            let schema = self.state.processed_avro_schema.as_mut().expect("Avro scheme failed to initialize");
-            let avro_value = to_value(&processed).expect("serde -> Avro Value failed");
-            let encoded = to_avro_datum(schema, avro_value).expect("Non-compliance with Avro scheme. Bad sanitization.");
 
-            
+            // --- Avro serialization ---
+            // let schema = self.state.processed_avro_schema.as_mut().expect("Avro scheme failed to initialize");
+            // let avro_value = to_value(&processed).expect("serde -> Avro Value failed");
+            // let encoded = to_avro_datum(schema, avro_value).expect("Non-compliance with Avro scheme. Bad sanitization.");
+
+            // --- JSON (serde) serialization ---
+            let encoded: Vec<u8> = serde_json::to_vec(&processed).expect("serde -> JSON bytes failed");
+
             *data = CumulativeAverage::new(decoded.t);
             data.add(decoded.ap * decoded.l);
             let _ = self.push_to_topic(&decoded.s, &encoded, now).await;
